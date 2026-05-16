@@ -1,23 +1,26 @@
 import sys
+import time
 
-
-def make_ring_belt(d: int, n: int) -> list[tuple[int, int]]:
+def make_horizontal_belt(row_pair: int, n: int) -> list[tuple[int, int]]:
+    """Create a 2-row belt at the given row_pair level (0-indexed pair).
+    
+    row_pair = 0 -> rows 0-1
+    row_pair = 1 -> rows 2-3
+    """
     cells: list[tuple[int, int]] = []
-    if n - 2 * d < 2:
+    top_row = row_pair * 2
+    bottom_row = row_pair * 2 + 1
+    
+    if bottom_row >= n:
         return cells
-
-    # top edge
-    for j in range(d, n - d):
-        cells.append((d, j))
-    # right edge
-    for i in range(d + 1, n - d):
-        cells.append((i, n - 1 - d))
-    # bottom edge
-    for j in range(n - 2 - d, d - 1, -1):
-        cells.append((n - 1 - d, j))
-    # left edge
-    for i in range(n - 2 - d, d, -1):
-        cells.append((i, d))
+    
+    # Top row: left to right
+    for j in range(n):
+        cells.append((top_row, j))
+    # Bottom row: right to left
+    for j in range(n - 1, -1, -1):
+        cells.append((bottom_row, j))
+    
     return cells
 
 
@@ -61,6 +64,70 @@ def maybe_extract(grid: list[list[int]], exit_pos: tuple[int, int], pos: dict[in
     return next_target
 
 
+def find_best_rotation_to_targets(current_idx: int, belt: list[tuple[int, int]], target_cells: list[tuple[int, int]], belt_index: dict[tuple[int, int], int]) -> tuple[int, int, tuple[int, int]] | None:
+    best: tuple[int, int, tuple[int, int]] | None = None
+    for cell in target_cells:
+        if cell not in belt_index:
+            continue
+        idx = belt_index[cell]
+        steps, direction = cycle_distance(current_idx, idx, len(belt))
+        if best is None or steps < best[0] or (steps == best[0] and direction == 1 and best[1] == -1):
+            best = (steps, direction, cell)
+    return best
+
+
+def should_gather_next_to_center(target_cell: tuple[int, int], next_cell: tuple[int, int]) -> bool:
+    target_row = target_cell[0]
+    next_row = next_cell[0]
+    if target_row % 2 == 0:
+        return next_row >= target_row + 2
+    return next_row > target_row
+
+
+def gather_value_to_column(value: int, target_col: int, grid: list[list[int]], belts: list[list[tuple[int, int]]], belt_index: list[dict[tuple[int, int], int]], cell_belts: dict[tuple[int, int], list[int]], pos: dict[int, tuple[int, int]], operations: list[tuple[int, int]], central_id: int, exit_pos: tuple[int, int], next_target: int, preserve_center_cell: tuple[int, int] | None = None) -> tuple[bool, int]:
+    cell = pos[value]
+    if central_id in cell_belts[cell]:
+        if cell[1] == target_col:
+            return False, next_target
+        if preserve_center_cell is not None and preserve_center_cell != cell:
+            return False, next_target
+        central_belt = belts[central_id]
+        current_idx = belt_index[central_id][cell]
+        target_cells = [c for c in central_belt if c[1] == target_col]
+        plan = find_best_rotation_to_targets(current_idx, central_belt, target_cells, belt_index[central_id])
+        if plan is None:
+            return False, next_target
+        steps, direction, _ = plan
+        for _ in range(steps):
+            rotate_belt(grid, central_belt, direction, pos)
+            operations.append((central_id, direction))
+            next_target = maybe_extract(grid, exit_pos, pos, next_target)
+        return True, next_target
+
+    belt_id = cell_belts[cell][0]
+    if belt_id == central_id:
+        return False, next_target
+
+    horiz_belt = belts[belt_id]
+    current_idx = belt_index[belt_id][cell]
+    top_row = belt_id * 2
+    bottom_row = belt_id * 2 + 1
+    target_cells: list[tuple[int, int]] = []
+    if top_row < len(grid):
+        target_cells.append((top_row, target_col))
+    if bottom_row < len(grid):
+        target_cells.append((bottom_row, target_col))
+    plan = find_best_rotation_to_targets(current_idx, horiz_belt, target_cells, belt_index[belt_id])
+    if plan is None:
+        return False, next_target
+    steps, direction, _ = plan
+    for _ in range(steps):
+        rotate_belt(grid, horiz_belt, direction, pos)
+        operations.append((belt_id, direction))
+        next_target = maybe_extract(grid, exit_pos, pos, next_target)
+    return True, next_target
+
+
 def main() -> None:
     data = sys.stdin.read().strip().split()
     if not data:
@@ -70,8 +137,8 @@ def main() -> None:
     grid = [[int(next(it)) for _ in range(n)] for _ in range(n)]
 
     belts: list[list[tuple[int, int]]] = []
-    for d in range(n // 2):
-        belt = make_ring_belt(d, n)
+    for row_pair in range(n // 2):
+        belt = make_horizontal_belt(row_pair, n)
         if len(belt) >= 2:
             belts.append(belt)
     central_belt = make_central_belt(n)
@@ -115,46 +182,76 @@ def main() -> None:
             belts_at_cell = cell_belts.get(cell, [])
             if central_id in belts_at_cell:
                 current_idx = belt_index[central_id][cell]
+                a_col = cell[1]
+                next_val = target + 1
+                if next_val in pos:
+                    next_cell = pos[next_val]
+                    if should_gather_next_to_center(cell, next_cell):
+                        gathered, next_target = gather_value_to_column(next_val, a_col, grid, belts, belt_index, cell_belts, pos, operations, central_id, exit_pos, next_target, preserve_center_cell=cell)
+                        if gathered:
+                            next_cell = pos[next_val]
+                            if next_cell[1] != a_col:
+                                continue
                 exit_idx = belt_index[central_id][exit_pos]
                 steps, direction = cycle_distance(current_idx, exit_idx, len(central_belt))
                 for _ in range(steps):
                     rotate_belt(grid, central_belt, direction, pos)
                     operations.append((central_id, direction))
                     next_target = maybe_extract(grid, exit_pos, pos, next_target)
+                    if next_target != target:
+                        break
+                    cell = pos[target]
+                    next_val = target + 1
+                    if next_val in pos and should_gather_next_to_center(cell, pos[next_val]):
+                        gathered, next_target = gather_value_to_column(next_val, cell[1], grid, belts, belt_index, cell_belts, pos, operations, central_id, exit_pos, next_target, preserve_center_cell=cell)
+                        if gathered:
+                            break
                 continue
 
-            ring_id = belts_at_cell[0]
-            ring = belts[ring_id]
-            current_idx = belt_index[ring_id][cell]
+            # Target is on a horizontal belt
+            horiz_id = belts_at_cell[0]
+            horiz = belts[horiz_id]
+            current_idx = belt_index[horiz_id][cell]
+            
+            # Find best intersection point to central belt
             best_plan = None
             c = n // 2
-            d = ring_id
+            
+            # Candidates: the two columns (c and c+1) in both rows of this horizontal belt
+            row_pair = horiz_id
+            top_row = row_pair * 2
+            bottom_row = row_pair * 2 + 1
+            
             candidates = [
-                (d, c),
-                (n - 1 - d, c),
-                (d, c + 1),
-                (n - 1 - d, c + 1),
+                (top_row, c),
+                (top_row, c + 1),
+                (bottom_row, c),
+                (bottom_row, c + 1),
             ]
+            
             for candidate in candidates:
-                if candidate not in belt_index[ring_id]:
+                if candidate not in belt_index[horiz_id]:
                     continue
-                ring_target_idx = belt_index[ring_id][candidate]
-                ring_steps, ring_dir = cycle_distance(current_idx, ring_target_idx, len(ring))
+                horiz_target_idx = belt_index[horiz_id][candidate]
+                horiz_steps, horiz_dir = cycle_distance(current_idx, horiz_target_idx, len(horiz))
+                
+                if candidate not in belt_index[central_id]:
+                    continue
                 central_target_idx = belt_index[central_id][candidate]
                 exit_idx = belt_index[central_id][exit_pos]
                 central_steps, central_dir = cycle_distance(central_target_idx, exit_idx, len(central_belt))
-                cost = ring_steps + central_steps
-                plan = (cost, ring_steps, candidate, ring_dir, central_dir)
+                cost = horiz_steps + central_steps
+                plan = (cost, horiz_steps, candidate, horiz_dir, central_dir)
                 if best_plan is None or plan < best_plan:
                     best_plan = plan
 
             if best_plan is None:
                 break
-            _, ring_steps, candidate_cell, ring_dir, _ = best_plan
-            if ring_steps > 0:
-                for _ in range(ring_steps):
-                    rotate_belt(grid, ring, ring_dir, pos)
-                    operations.append((ring_id, ring_dir))
+            _, horiz_steps, candidate_cell, horiz_dir, _ = best_plan
+            if horiz_steps > 0:
+                for _ in range(horiz_steps):
+                    rotate_belt(grid, horiz, horiz_dir, pos)
+                    operations.append((horiz_id, horiz_dir))
                     next_target = maybe_extract(grid, exit_pos, pos, next_target)
                 if target < next_target:
                     break
@@ -168,6 +265,13 @@ def main() -> None:
                 break
             if current_cell not in belt_index[central_id]:
                 break
+            next_val = target + 1
+            if next_val in pos and should_gather_next_to_center(current_cell, pos[next_val]):
+                gathered, next_target = gather_value_to_column(next_val, current_cell[1], grid, belts, belt_index, cell_belts, pos, operations, central_id, exit_pos, next_target, preserve_center_cell=current_cell)
+                if gathered:
+                    current_cell = pos.get(target)
+                    if current_cell is None or current_cell not in belt_index[central_id]:
+                        break
             current_idx = belt_index[central_id][current_cell]
             exit_idx = belt_index[central_id][exit_pos]
             central_steps, central_dir = cycle_distance(current_idx, exit_idx, len(central_belt))
@@ -189,4 +293,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    st = time.time()
     main()
+    en = time.time()
+    print(f"Execution time: {en - st:.2f} seconds", file=sys.stderr)
