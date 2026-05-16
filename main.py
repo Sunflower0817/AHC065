@@ -128,6 +128,24 @@ def gather_value_to_column(value: int, target_col: int, grid: list[list[int]], b
     return True, next_target
 
 
+def gather_following_values_to_center(start_value: int, target_col: int, anchor_cell: tuple[int, int], grid: list[list[int]], belts: list[list[tuple[int, int]]], belt_index: list[dict[tuple[int, int], int]], cell_belts: dict[tuple[int, int], list[int]], pos: dict[int, tuple[int, int]], operations: list[tuple[int, int]], central_id: int, exit_pos: tuple[int, int], next_target: int) -> tuple[bool, int]:
+    gathered_any = False
+    value = start_value
+    last_center_cell = anchor_cell
+    while value in pos and should_gather_next_to_center(last_center_cell, pos[value]):
+        if pos[value][1] == target_col:
+            last_center_cell = pos[value]
+            value += 1
+            continue
+        gathered, next_target = gather_value_to_column(value, target_col, grid, belts, belt_index, cell_belts, pos, operations, central_id, exit_pos, next_target, preserve_center_cell=last_center_cell)
+        if not gathered or value not in pos or pos[value][1] != target_col:
+            break
+        gathered_any = True
+        last_center_cell = pos[value]
+        value += 1
+    return gathered_any, next_target
+
+
 def main() -> None:
     data = sys.stdin.read().strip().split()
     if not data:
@@ -183,15 +201,9 @@ def main() -> None:
             if central_id in belts_at_cell:
                 current_idx = belt_index[central_id][cell]
                 a_col = cell[1]
-                next_val = target + 1
-                if next_val in pos:
-                    next_cell = pos[next_val]
-                    if should_gather_next_to_center(cell, next_cell):
-                        gathered, next_target = gather_value_to_column(next_val, a_col, grid, belts, belt_index, cell_belts, pos, operations, central_id, exit_pos, next_target, preserve_center_cell=cell)
-                        if gathered:
-                            next_cell = pos[next_val]
-                            if next_cell[1] != a_col:
-                                continue
+                gathered, next_target = gather_following_values_to_center(target + 1, a_col, cell, grid, belts, belt_index, cell_belts, pos, operations, central_id, exit_pos, next_target)
+                if gathered and target + 1 in pos and pos[target + 1][1] != a_col:
+                    continue
                 exit_idx = belt_index[central_id][exit_pos]
                 steps, direction = cycle_distance(current_idx, exit_idx, len(central_belt))
                 for _ in range(steps):
@@ -201,11 +213,9 @@ def main() -> None:
                     if next_target != target:
                         break
                     cell = pos[target]
-                    next_val = target + 1
-                    if next_val in pos and should_gather_next_to_center(cell, pos[next_val]):
-                        gathered, next_target = gather_value_to_column(next_val, cell[1], grid, belts, belt_index, cell_belts, pos, operations, central_id, exit_pos, next_target, preserve_center_cell=cell)
-                        if gathered:
-                            break
+                    gathered, next_target = gather_following_values_to_center(target + 1, cell[1], cell, grid, belts, belt_index, cell_belts, pos, operations, central_id, exit_pos, next_target)
+                    if gathered:
+                        break
                 continue
 
             # Target is on a horizontal belt
@@ -265,13 +275,11 @@ def main() -> None:
                 break
             if current_cell not in belt_index[central_id]:
                 break
-            next_val = target + 1
-            if next_val in pos and should_gather_next_to_center(current_cell, pos[next_val]):
-                gathered, next_target = gather_value_to_column(next_val, current_cell[1], grid, belts, belt_index, cell_belts, pos, operations, central_id, exit_pos, next_target, preserve_center_cell=current_cell)
-                if gathered:
-                    current_cell = pos.get(target)
-                    if current_cell is None or current_cell not in belt_index[central_id]:
-                        break
+            gathered, next_target = gather_following_values_to_center(target + 1, current_cell[1], current_cell, grid, belts, belt_index, cell_belts, pos, operations, central_id, exit_pos, next_target)
+            if gathered:
+                current_cell = pos.get(target)
+                if current_cell is None or current_cell not in belt_index[central_id]:
+                    break
             current_idx = belt_index[central_id][current_cell]
             exit_idx = belt_index[central_id][exit_pos]
             central_steps, central_dir = cycle_distance(current_idx, exit_idx, len(central_belt))
