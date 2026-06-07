@@ -1,5 +1,27 @@
 import sys
 import time
+from dataclasses import dataclass
+
+
+BEAM_WIDTH = 16
+LOOKAHEAD_BOXES = 6
+MAX_OPERATIONS = 100000
+SELECT_OVERALL = 8
+SELECT_ORDER = 4
+SELECT_READY = 2
+SELECT_ROW = 2
+SELECT_SHORT = 0
+
+
+@dataclass
+class BeamState:
+    grid: list[list[int]]
+    pos: dict[int, tuple[int, int]]
+    operations: list[tuple[int, int]]
+    next_target: int
+    parent: "BeamState | None" = None
+    op_count: int = 0
+    sort_key: tuple[int, int, int, int, int, bool] | None = None
 
 def make_horizontal_belt(row_pair: int, n: int) -> list[tuple[int, int]]:
     """Create a 2-row belt at the given row_pair level (0-indexed pair).
@@ -53,12 +75,35 @@ def steps_with_fixed_direction(src: int, dst: int, length: int, direction: int) 
 
 def rotate_belt(grid: list[list[int]], belt: list[tuple[int, int]], d: int, pos: dict[int, tuple[int, int]]) -> None:
     length = len(belt)
-    old_values = [grid[i][j] for i, j in belt]
-    for idx, (i, j) in enumerate(belt):
-        new_val = old_values[(idx - d) % length]
-        grid[i][j] = new_val
-        if new_val >= 0:
-            pos[new_val] = (i, j)
+    if d == 1:
+        last_i, last_j = belt[-1]
+        carried = grid[last_i][last_j]
+        for idx in range(length - 1, 0, -1):
+            src_i, src_j = belt[idx - 1]
+            dst_i, dst_j = belt[idx]
+            value = grid[src_i][src_j]
+            grid[dst_i][dst_j] = value
+            if value >= 0:
+                pos[value] = (dst_i, dst_j)
+        first_i, first_j = belt[0]
+        grid[first_i][first_j] = carried
+        if carried >= 0:
+            pos[carried] = (first_i, first_j)
+        return
+
+    first_i, first_j = belt[0]
+    carried = grid[first_i][first_j]
+    for idx in range(length - 1):
+        src_i, src_j = belt[idx + 1]
+        dst_i, dst_j = belt[idx]
+        value = grid[src_i][src_j]
+        grid[dst_i][dst_j] = value
+        if value >= 0:
+            pos[value] = (dst_i, dst_j)
+    last_i, last_j = belt[-1]
+    grid[last_i][last_j] = carried
+    if carried >= 0:
+        pos[carried] = (last_i, last_j)
 
 
 def maybe_extract(grid: list[list[int]], exit_pos: tuple[int, int], pos: dict[int, tuple[int, int]], next_target: int) -> int:
@@ -171,6 +216,26 @@ def gather_value_to_column(value: int, target_col: int, grid: list[list[int]], b
     return False, next_target
 
 
+def gather_value_to_center_cell(value: int, target_cell: tuple[int, int], grid: list[list[int]], belts: list[list[tuple[int, int]]], belt_index: list[dict[tuple[int, int], int]], cell_belts: dict[tuple[int, int], list[int]], pos: dict[int, tuple[int, int]], operations: list[tuple[int, int]], central_id: int, exit_pos: tuple[int, int], next_target: int, protected_cells: tuple[tuple[int, int], ...] = ()) -> tuple[bool, int]:
+    cell = pos[value]
+    if cell == target_cell:
+        return False, next_target
+    horiz_id = find_horizontal_belt_id(cell, cell_belts, central_id)
+    if horiz_id is None or target_cell not in belt_index[horiz_id]:
+        return False, next_target
+    for protected_cell in protected_cells:
+        if find_horizontal_belt_id(protected_cell, cell_belts, central_id) == horiz_id:
+            return False, next_target
+    current_idx = belt_index[horiz_id][cell]
+    target_idx = belt_index[horiz_id][target_cell]
+    steps, direction = cycle_distance(current_idx, target_idx, len(belts[horiz_id]))
+    for _ in range(steps):
+        rotate_belt(grid, belts[horiz_id], direction, pos)
+        operations.append((horiz_id, direction))
+        next_target = maybe_extract(grid, exit_pos, pos, next_target)
+    return True, next_target
+
+
 def gather_following_values_to_center(start_value: int, target_col: int, anchor_cell: tuple[int, int], grid: list[list[int]], belts: list[list[tuple[int, int]]], belt_index: list[dict[tuple[int, int], int]], cell_belts: dict[tuple[int, int], list[int]], pos: dict[int, tuple[int, int]], operations: list[tuple[int, int]], central_id: int, central_direction: int, exit_pos: tuple[int, int], next_target: int) -> tuple[bool, int]:
     if anchor_cell[1] != target_col:
         return False, next_target
@@ -189,6 +254,332 @@ def gather_following_values_to_center(start_value: int, target_col: int, anchor_
         last_center_cell = pos[value]
         value += 1
     return gathered_any, next_target
+
+
+def clone_state(state: BeamState) -> BeamState:
+    return BeamState(
+        [row[:] for row in state.grid],
+        dict(state.pos),
+        [],
+        state.next_target,
+        state,
+        total_operations(state),
+    )
+
+
+def total_operations(state: BeamState) -> int:
+    return state.op_count + len(state.operations)
+
+
+def restore_operations(state: BeamState) -> list[tuple[int, int]]:
+    chunks: list[list[tuple[int, int]]] = []
+    current: BeamState | None = state
+    while current is not None:
+        chunks.append(current.operations)
+        current = current.parent
+    result: list[tuple[int, int]] = []
+    for chunk in reversed(chunks):
+        result.extend(chunk)
+    return result
+
+
+def ready_count(next_target: int, pos: dict[int, tuple[int, int]], center_col: int, total: int, limit: int = LOOKAHEAD_BOXES) -> int:
+    count = 0
+    for value in range(next_target, min(total, next_target + limit)):
+        if value not in pos or pos[value][1] != center_col:
+            break
+        count += 1
+    return count
+
+
+def central_order_score(next_target: int, pos: dict[int, tuple[int, int]], belt_index: dict[tuple[int, int], int], center_col: int, total: int, central_direction: int, limit: int = LOOKAHEAD_BOXES) -> int:
+    score = 0
+    previous_steps = -1
+    exit_idx = belt_index[(0, center_col)]
+    for value in range(next_target, min(total, next_target + limit)):
+        cell = pos.get(value)
+        if cell is None or cell[1] != center_col:
+            break
+        steps = steps_with_fixed_direction(belt_index[cell], exit_idx, len(belt_index), central_direction)
+        if previous_steps <= steps:
+            score += limit - (value - next_target)
+            previous_steps = steps
+        else:
+            break
+    return score
+
+
+def state_sort_key(state: BeamState, n: int, belts: list[list[tuple[int, int]]], belt_index: list[dict[tuple[int, int], int]], cell_belts: dict[tuple[int, int], list[int]], central_id: int, center_col: int, central_direction: int) -> tuple[int, int, int, int, int, bool]:
+    if state.sort_key is not None:
+        return state.sort_key
+    total = n * n
+    operation_count = total_operations(state)
+    state.sort_key = (
+        state.next_target,
+        -operation_count,
+        central_order_score(state.next_target, state.pos, belt_index[central_id], center_col, total, central_direction),
+        ready_count(state.next_target, state.pos, center_col, total),
+        -operation_count,
+        state.next_target >= total,
+    )
+    return state.sort_key
+
+
+def prepare_values_to_center(state: BeamState, chain_limit: int, n: int, belts: list[list[tuple[int, int]]], belt_index: list[dict[tuple[int, int], int]], cell_belts: dict[tuple[int, int], list[int]], central_id: int, central_direction: int, center_col: int, exit_pos: tuple[int, int]) -> bool:
+    total = n * n
+    first_value = state.next_target
+    last_center_cell: tuple[int, int] | None = None
+    prepared = 0
+    value = first_value
+    while value < total and prepared < chain_limit:
+        if value < state.next_target:
+            value = state.next_target
+            continue
+        if value not in state.pos:
+            value += 1
+            continue
+        cell = state.pos[value]
+        if prepared > 0 and last_center_cell is not None and not should_gather_next_to_center(last_center_cell, cell):
+            break
+        if cell[1] != center_col:
+            gathered, next_target = gather_value_to_column(
+                value,
+                center_col,
+                state.grid,
+                belts,
+                belt_index,
+                cell_belts,
+                state.pos,
+                state.operations,
+                central_id,
+                central_direction,
+                exit_pos,
+                state.next_target,
+                preserve_center_cell=last_center_cell,
+            )
+            state.next_target = next_target
+            if value < state.next_target:
+                value = state.next_target
+                last_center_cell = None
+                prepared = 0
+                continue
+            if not gathered or value not in state.pos or state.pos[value][1] != center_col:
+                break
+        last_center_cell = state.pos[value]
+        prepared += 1
+        value += 1
+    return first_value < state.next_target or (first_value in state.pos and state.pos[first_value][1] == center_col)
+
+
+def prepare_gap_insert(state: BeamState, n: int, belts: list[list[tuple[int, int]]], belt_index: list[dict[tuple[int, int], int]], cell_belts: dict[tuple[int, int], list[int]], central_id: int, central_direction: int, center_col: int, exit_pos: tuple[int, int]) -> bool:
+    total = n * n
+    a = state.next_target
+    if a + 2 >= total or a not in state.pos or a + 1 not in state.pos or a + 2 not in state.pos:
+        return False
+    if state.pos[a][1] != center_col:
+        gathered, next_target = gather_value_to_column(a, center_col, state.grid, belts, belt_index, cell_belts, state.pos, state.operations, central_id, central_direction, exit_pos, state.next_target)
+        state.next_target = next_target
+        if a not in state.pos or state.pos[a][1] != center_col:
+            return a < state.next_target
+    a_cell = state.pos[a]
+    if state.pos[a + 2][1] != center_col:
+        gathered, next_target = gather_value_to_column(a + 2, center_col, state.grid, belts, belt_index, cell_belts, state.pos, state.operations, central_id, central_direction, exit_pos, state.next_target, preserve_center_cell=a_cell)
+        state.next_target = next_target
+        if not gathered or a + 2 not in state.pos or state.pos[a + 2][1] != center_col:
+            return False
+    if a not in state.pos:
+        return True
+    a_cell = state.pos[a]
+    a2_cell = state.pos[a + 2]
+    exit_idx = belt_index[central_id][exit_pos]
+    a_steps = steps_with_fixed_direction(belt_index[central_id][a_cell], exit_idx, len(belts[central_id]), central_direction)
+    a2_steps = steps_with_fixed_direction(belt_index[central_id][a2_cell], exit_idx, len(belts[central_id]), central_direction)
+    if a2_steps - a_steps < 2:
+        return False
+    a1_cell = state.pos[a + 1]
+    if a1_cell[1] == center_col:
+        a1_steps = steps_with_fixed_direction(belt_index[central_id][a1_cell], exit_idx, len(belts[central_id]), central_direction)
+        return a_steps < a1_steps < a2_steps
+    horiz_id = find_horizontal_belt_id(a1_cell, cell_belts, central_id)
+    if horiz_id is None:
+        return False
+    target_cells: list[tuple[int, int]] = []
+    for target_cell in ((horiz_id * 2, center_col), (horiz_id * 2 + 1, center_col)):
+        if target_cell not in belt_index[central_id]:
+            continue
+        target_steps = steps_with_fixed_direction(belt_index[central_id][target_cell], exit_idx, len(belts[central_id]), central_direction)
+        if a_steps < target_steps < a2_steps:
+            target_cells.append(target_cell)
+    best_plan: tuple[int, tuple[int, int]] | None = None
+    for target_cell in target_cells:
+        if target_cell not in belt_index[horiz_id]:
+            continue
+        current_idx = belt_index[horiz_id][a1_cell]
+        target_idx = belt_index[horiz_id][target_cell]
+        steps, _ = cycle_distance(current_idx, target_idx, len(belts[horiz_id]))
+        plan = (steps, target_cell)
+        if best_plan is None or plan < best_plan:
+            best_plan = plan
+    if best_plan is None:
+        return False
+    _, target_cell = best_plan
+    gathered, next_target = gather_value_to_center_cell(a + 1, target_cell, state.grid, belts, belt_index, cell_belts, state.pos, state.operations, central_id, exit_pos, state.next_target, protected_cells=(a_cell, a2_cell))
+    state.next_target = next_target
+    if a + 1 not in state.pos:
+        return True
+    a1_cell = state.pos[a + 1]
+    if a1_cell[1] != center_col:
+        return False
+    a1_steps = steps_with_fixed_direction(belt_index[central_id][a1_cell], exit_idx, len(belts[central_id]), central_direction)
+    return a_steps < a1_steps < a2_steps
+
+
+def move_center_until_next_extracts(state: BeamState, n: int, belts: list[list[tuple[int, int]]], belt_index: list[dict[tuple[int, int], int]], cell_belts: dict[tuple[int, int], list[int]], central_id: int, central_direction: int, center_col: int, exit_pos: tuple[int, int]) -> bool:
+    if state.next_target not in state.pos:
+        return True
+    cell = state.pos[state.next_target]
+    if cell not in belt_index[central_id] or cell[1] != exit_pos[1]:
+        return False
+    current_idx = belt_index[central_id][cell]
+    exit_idx = belt_index[central_id][exit_pos]
+    steps = steps_with_fixed_direction(current_idx, exit_idx, len(belts[central_id]), central_direction)
+    before = state.next_target
+    tried_mid_gather = False
+    for _ in range(steps):
+        if total_operations(state) >= MAX_OPERATIONS:
+            return False
+        rotate_belt(state.grid, belts[central_id], central_direction, state.pos)
+        state.operations.append((central_id, central_direction))
+        state.next_target = maybe_extract(state.grid, exit_pos, state.pos, state.next_target)
+        if state.next_target == before and not tried_mid_gather and before in state.pos:
+            current_cell = state.pos[before]
+            gathered, next_target = gather_following_values_to_center(
+                before + 1,
+                center_col,
+                current_cell,
+                state.grid,
+                belts,
+                belt_index,
+                cell_belts,
+                state.pos,
+                state.operations,
+                central_id,
+                central_direction,
+                exit_pos,
+                state.next_target,
+            )
+            state.next_target = next_target
+            if gathered:
+                tried_mid_gather = True
+    state.next_target = maybe_extract(state.grid, exit_pos, state.pos, state.next_target)
+    return state.next_target > before
+
+
+def expand_state(state: BeamState, n: int, belts: list[list[tuple[int, int]]], belt_index: list[dict[tuple[int, int], int]], cell_belts: dict[tuple[int, int], list[int]], central_id: int, central_direction: int, center_col: int, exit_pos: tuple[int, int]) -> list[BeamState]:
+    total = n * n
+    children: list[BeamState] = []
+    if state.next_target >= total:
+        return children
+    for chain_limit in range(1, LOOKAHEAD_BOXES + 1):
+        child = clone_state(state)
+        if not prepare_values_to_center(child, chain_limit, n, belts, belt_index, cell_belts, central_id, central_direction, center_col, exit_pos):
+            continue
+        if not move_center_until_next_extracts(child, n, belts, belt_index, cell_belts, central_id, central_direction, center_col, exit_pos):
+            continue
+        if total_operations(child) <= MAX_OPERATIONS:
+            children.append(child)
+    child = clone_state(state)
+    if prepare_gap_insert(child, n, belts, belt_index, cell_belts, central_id, central_direction, center_col, exit_pos):
+        if move_center_until_next_extracts(child, n, belts, belt_index, cell_belts, central_id, central_direction, center_col, exit_pos):
+            if total_operations(child) <= MAX_OPERATIONS:
+                children.append(child)
+    return children
+
+
+def select_beam(candidates: list[BeamState], n: int, belts: list[list[tuple[int, int]]], belt_index: list[dict[tuple[int, int], int]], cell_belts: dict[tuple[int, int], list[int]], central_id: int, center_col: int, central_direction: int) -> list[BeamState]:
+    total = n * n
+    selected: list[BeamState] = []
+    selected_ids: set[int] = set()
+
+    def add_from(states: list[BeamState], limit: int) -> None:
+        for state in states:
+            if id(state) in selected_ids:
+                continue
+            selected.append(state)
+            selected_ids.add(id(state))
+            if len(selected) >= BEAM_WIDTH or limit <= 1:
+                return
+            limit -= 1
+
+    candidates.sort(key=lambda state: state_sort_key(state, n, belts, belt_index, cell_belts, central_id, center_col, central_direction), reverse=True)
+    add_from(candidates, SELECT_OVERALL)
+
+    by_order = sorted(
+        candidates,
+        key=lambda state: (
+            state_sort_key(state, n, belts, belt_index, cell_belts, central_id, center_col, central_direction)[2],
+            state.next_target,
+            -total_operations(state),
+        ),
+        reverse=True,
+    )
+    add_from(by_order, SELECT_ORDER)
+
+    by_ready = sorted(
+        candidates,
+        key=lambda state: (
+            state_sort_key(state, n, belts, belt_index, cell_belts, central_id, center_col, central_direction)[3],
+            state.next_target,
+            -total_operations(state),
+        ),
+        reverse=True,
+    )
+    add_from(by_ready, SELECT_READY)
+
+    by_next_row: dict[int, BeamState] = {}
+    for state in candidates:
+        cell = state.pos.get(state.next_target)
+        row = -1 if cell is None else cell[0]
+        current = by_next_row.get(row)
+        if current is None or state_sort_key(state, n, belts, belt_index, cell_belts, central_id, center_col, central_direction) > state_sort_key(current, n, belts, belt_index, cell_belts, central_id, center_col, central_direction):
+            by_next_row[row] = state
+    add_from(
+        sorted(by_next_row.values(), key=lambda state: state_sort_key(state, n, belts, belt_index, cell_belts, central_id, center_col, central_direction), reverse=True),
+        SELECT_ROW,
+    )
+
+    by_short = sorted(candidates, key=lambda state: (-state.next_target, total_operations(state)))
+    add_from(by_short, SELECT_SHORT)
+    add_from(candidates, BEAM_WIDTH - len(selected))
+    return selected[:BEAM_WIDTH]
+
+
+def beam_search(initial_grid: list[list[int]], belts: list[list[tuple[int, int]]], belt_index: list[dict[tuple[int, int], int]], cell_belts: dict[tuple[int, int], list[int]], central_id: int, central_direction: int, center_col: int, exit_pos: tuple[int, int]) -> BeamState:
+    n = len(initial_grid)
+    total = n * n
+    pos: dict[int, tuple[int, int]] = {}
+    for i in range(n):
+        for j in range(n):
+            pos[initial_grid[i][j]] = (i, j)
+    next_target = maybe_extract(initial_grid, exit_pos, pos, 0)
+    initial = BeamState(initial_grid, pos, [], next_target)
+    beam = [initial]
+    best = initial
+
+    while beam:
+        if any(state.next_target >= total for state in beam):
+            best = max(beam, key=lambda state: state_sort_key(state, n, belts, belt_index, cell_belts, central_id, center_col, central_direction))
+            break
+        candidates: list[BeamState] = []
+        for state in beam:
+            candidates.extend(expand_state(state, n, belts, belt_index, cell_belts, central_id, central_direction, center_col, exit_pos))
+        if not candidates:
+            best = max(beam, key=lambda state: state_sort_key(state, n, belts, belt_index, cell_belts, central_id, center_col, central_direction))
+            break
+        beam = select_beam(candidates, n, belts, belt_index, cell_belts, central_id, center_col, central_direction)
+        if beam and state_sort_key(beam[0], n, belts, belt_index, cell_belts, central_id, center_col, central_direction) > state_sort_key(best, n, belts, belt_index, cell_belts, central_id, center_col, central_direction):
+            best = beam[0]
+    return best
 
 
 def main() -> None:
@@ -223,129 +614,9 @@ def main() -> None:
         if len(ids) > 2:
             raise AssertionError(f"Cell {cell} belongs to more than 2 belts: {ids}")
 
-    pos: dict[int, tuple[int, int]] = {}
-    for i in range(n):
-        for j in range(n):
-            pos[grid[i][j]] = (i, j)
-
     exit_pos = (0, n // 2)
-    operations: list[tuple[int, int]] = []
-    next_target = 0
-    next_target = maybe_extract(grid, exit_pos, pos, next_target)
-
-    for target in range(n * n):
-        if target < next_target:
-            continue
-        tried_gathering_followers = False
-        while next_target == target:
-            if target not in pos:
-                break
-            cell = pos[target]
-            if cell == exit_pos:
-                next_target = maybe_extract(grid, exit_pos, pos, next_target)
-                break
-
-            belts_at_cell = cell_belts.get(cell, [])
-            if central_id in belts_at_cell:
-                current_idx = belt_index[central_id][cell]
-                gathered = False
-                if not tried_gathering_followers:
-                    gathered, next_target = gather_following_values_to_center(target + 1, center_col, cell, grid, belts, belt_index, cell_belts, pos, operations, central_id, central_direction, exit_pos, next_target)
-                    if gathered:
-                        tried_gathering_followers = True
-                if gathered and target + 1 in pos and pos[target + 1][1] != center_col:
-                    continue
-                if target not in pos:
-                    break
-                cell = pos[target]
-                if cell not in belt_index[central_id]:
-                    continue
-                current_idx = belt_index[central_id][cell]
-                exit_idx = belt_index[central_id][exit_pos]
-                steps = steps_with_fixed_direction(current_idx, exit_idx, len(central_belt), central_direction)
-                for _ in range(steps):
-                    rotate_belt(grid, central_belt, central_direction, pos)
-                    operations.append((central_id, central_direction))
-                    next_target = maybe_extract(grid, exit_pos, pos, next_target)
-                    if next_target != target:
-                        break
-                    cell = pos[target]
-                    gathered = False
-                    if not tried_gathering_followers:
-                        gathered, next_target = gather_following_values_to_center(target + 1, center_col, cell, grid, belts, belt_index, cell_belts, pos, operations, central_id, central_direction, exit_pos, next_target)
-                        if gathered:
-                            tried_gathering_followers = True
-                    if gathered:
-                        break
-                continue
-
-            # Target is on a horizontal belt
-            horiz_id = belts_at_cell[0]
-            horiz = belts[horiz_id]
-            current_idx = belt_index[horiz_id][cell]
-            
-            # Find best intersection point to central belt
-            best_plan = None
-            c = center_col
-            
-            # Candidates: only the center column. The central belt always discharges upward on this column.
-            row_pair = horiz_id
-            top_row = row_pair * 2
-            bottom_row = row_pair * 2 + 1
-            
-            candidates = [
-                (top_row, c),
-                (bottom_row, c),
-            ]
-            
-            for candidate in candidates:
-                if candidate not in belt_index[horiz_id]:
-                    continue
-                horiz_target_idx = belt_index[horiz_id][candidate]
-                horiz_steps, horiz_dir = cycle_distance(current_idx, horiz_target_idx, len(horiz))
-                
-                if candidate not in belt_index[central_id]:
-                    continue
-                central_target_idx = belt_index[central_id][candidate]
-                exit_idx = belt_index[central_id][exit_pos]
-                central_steps = steps_with_fixed_direction(central_target_idx, exit_idx, len(central_belt), central_direction)
-                cost = horiz_steps + central_steps
-                plan = (cost, horiz_steps, candidate, horiz_dir)
-                if best_plan is None or plan < best_plan:
-                    best_plan = plan
-
-            if best_plan is None:
-                break
-            _, horiz_steps, candidate_cell, horiz_dir = best_plan
-            if horiz_steps > 0:
-                for _ in range(horiz_steps):
-                    rotate_belt(grid, horiz, horiz_dir, pos)
-                    operations.append((horiz_id, horiz_dir))
-                    next_target = maybe_extract(grid, exit_pos, pos, next_target)
-                if target < next_target:
-                    break
-
-            if candidate_cell == exit_pos:
-                next_target = maybe_extract(grid, exit_pos, pos, next_target)
-                break
-
-            current_cell = pos.get(target)
-            if current_cell is None:
-                break
-            if current_cell not in belt_index[central_id]:
-                break
-            gathered, next_target = gather_following_values_to_center(target + 1, center_col, current_cell, grid, belts, belt_index, cell_belts, pos, operations, central_id, central_direction, exit_pos, next_target)
-            if gathered:
-                current_cell = pos.get(target)
-                if current_cell is None or current_cell not in belt_index[central_id]:
-                    break
-            current_idx = belt_index[central_id][current_cell]
-            exit_idx = belt_index[central_id][exit_pos]
-            central_steps = steps_with_fixed_direction(current_idx, exit_idx, len(central_belt), central_direction)
-            for _ in range(central_steps):
-                rotate_belt(grid, central_belt, central_direction, pos)
-                operations.append((central_id, central_direction))
-                next_target = maybe_extract(grid, exit_pos, pos, next_target)
+    best_state = beam_search(grid, belts, belt_index, cell_belts, central_id, central_direction, center_col, exit_pos)
+    operations = restore_operations(best_state)
 
     print(len(belts))
     for belt in belts:
